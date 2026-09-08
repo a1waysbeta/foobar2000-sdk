@@ -1,7 +1,7 @@
 name: Build foobar2000 SDK (x86 + x64, Debug + Release)
 
 on:
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
   push:
     paths:
       - '**/*.vcxproj'
@@ -15,11 +15,10 @@ jobs:
     strategy:
       matrix:
         include:
-          # 4 个配置：Debug|Win32, Release|Win32, Debug|x64, Release|x64
-          - { platform: Win32, configuration: Debug,   outdir: debug-x86, libname_dir: foobar2000_SDK }
-          - { platform: Win32, configuration: Release, outdir: x86,        libname_dir: foobar2000_SDK }
-          - { platform: x64,   configuration: Debug,   outdir: debug-x64, libname_dir: foobar2000_SDK }
-          - { platform: x64,   configuration: Release, outdir: x64,        libname_dir: foobar2000_SDK }
+          - { platform: Win32, configuration: Debug,   outdir: debug-x86 }
+          - { platform: Win32, configuration: Release, outdir: x86 }
+          - { platform: x64,   configuration: Debug,   outdir: debug-x64 }
+          - { platform: x64,   configuration: Release, outdir: x64 }
 
     steps:
       - name: Checkout SDK
@@ -28,15 +27,15 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
-      - name: Fix Platform Toolset v142 → v143
+      - name: Fix Platform Toolset v142 to v143
         shell: pwsh
         run: |
           Get-ChildItem -Path . -Recurse -Filter *.vcxproj | ForEach-Object {
             $content = Get-Content $_.FullName -Raw
-            if ($content -match 'v142') {
+            if ($content -match '<PlatformToolset>v142</PlatformToolset>') {
               Write-Host "Fixing: $($_.FullName)"
-              $content -replace '<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>' |
-                Set-Content $_.FullName -NoNewline
+              $content = $content.Replace('<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>')
+              Set-Content -Path $_.FullName -Value $content -NoNewline
             }
           }
 
@@ -57,6 +56,15 @@ jobs:
             /p:Platform=${{ matrix.platform }} ^
             /p:OutDir=${{ matrix.outdir }}\pfc\ ^
             /p:IntDir=obj\pfc\${{ matrix.outdir }}\
+
+      - name: Build libPPUI.lib
+        shell: cmd
+        run: |
+          msbuild libPPUI\libPPUI.vcxproj ^
+            /p:Configuration=${{ matrix.configuration }} ^
+            /p:Platform=${{ matrix.platform }} ^
+            /p:OutDir=${{ matrix.outdir }}\libPPUI\ ^
+            /p:IntDir=obj\libPPUI\${{ matrix.outdir }}\
 
       - name: Build foobar2000_component_client.lib
         shell: cmd
@@ -84,19 +92,18 @@ jobs:
           name: sdk-${{ matrix.outdir }}
           path: |
             ${{ matrix.outdir }}/
-            !obj/
           retention-days: 90
 
   # ============================================================
-  # 单独编译 shared 库（输出 shared-Win32.lib / shared-x64.lib）
+  # shared 库 - 编译为 StaticLibrary
   # ============================================================
   build-shared:
     runs-on: windows-2022
     strategy:
       matrix:
         include:
-          - { platform: Win32, target_name: shared-Win32 }
-          - { platform: x64,   target_name: shared-x64 }
+          - { platform: Win32, target_name: shared-Win32, outdir_tag: Win32 }
+          - { platform: x64,   target_name: shared-x64,   outdir_tag: x64 }
     steps:
       - name: Checkout SDK
         uses: actions/checkout@v4
@@ -104,52 +111,46 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
-      - name: Fix Platform Toolset v142 → v143
+      - name: Fix Platform Toolset v142 to v143
         shell: pwsh
         run: |
           Get-ChildItem -Path . -Recurse -Filter *.vcxproj | ForEach-Object {
             $content = Get-Content $_.FullName -Raw
             if ($content -match '<PlatformToolset>v142</PlatformToolset>') {
-              $content -replace '<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>' |
-                Set-Content $_.FullName -NoNewline
+              $content = $content.Replace('<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>')
+              Set-Content -Path $_.FullName -Value $content -NoNewline
             }
           }
 
-      - name: Patch shared.vcxproj to StaticLibrary + correct TargetName
+      - name: Patch shared.vcxproj to StaticLibrary
         shell: pwsh
         run: |
-          $f = "foobar2000\shared\shared.vcxproj"
+          $f = 'foobar2000\shared\shared.vcxproj'
           $c = Get-Content $f -Raw
-          # 把所有 DynamicLibrary 改成 StaticLibrary（让 shared 输出 .lib 而不是 .dll）
-          $c = $c -replace '<ConfigurationType>DynamicLibrary</ConfigurationType>', '<ConfigurationType>StaticLibrary</ConfigurationType>'
-          # 让输出文件名按平台区分：Win32 → shared-Win32, x64 → shared-x64
-          # 通过注入 TargetName 实现
-          $c = $c -replace '</Project>', "<ItemDefinitionGroup Condition=`"`'`$(Configuration)|`$(Platform)`'==`'Release|$($args[0])`'`"><Lib><OutputFile>`$(OutDir)$($args[1]).lib</OutputFile></Lib></ItemDefinitionGroup></Project>"
-          Set-Content $f -Value $c -NoNewline
-        env: { args0: ${{ matrix.platform }}, args1: ${{ matrix.target_name }} }
+          $c = $c.Replace('<ConfigurationType>DynamicLibrary</ConfigurationType>', '<ConfigurationType>StaticLibrary</ConfigurationType>')
+          Set-Content -Path $f -Value $c -NoNewline
+          Write-Host "Patched shared.vcxproj to StaticLibrary"
 
-      - name: Build shared (Release ${{ matrix.platform }})
+      - name: Build shared (${{ matrix.target_name }})
         shell: cmd
         run: |
           msbuild foobar2000\shared\shared.vcxproj ^
             /p:Configuration=Release ^
             /p:Platform=${{ matrix.platform }} ^
-            /p:OutDir=shared-output\ ^
             /p:TargetName=${{ matrix.target_name }} ^
-            /p:IntDir=obj\shared\${{ matrix.platform }}\
+            /p:OutDir=shared-output\ ^
+            /p:IntDir=obj\shared\${{ matrix.outdir_tag }}\
 
-      - name: Rename shared.lib to target name (fallback)
+      - name: Verify output
         shell: cmd
         run: |
-          if exist shared-output\shared.lib (
-            move shared-output\shared.lib shared-output\${{ matrix.target_name }}.lib
-          )
+          echo === shared-output directory ===
           dir shared-output\
 
       - name: Upload shared artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sdk-shared-${{ matrix.platform }}
+          name: sdk-shared-${{ matrix.outdir_tag }}
           path: shared-output/
           retention-days: 90
 
@@ -171,26 +172,31 @@ jobs:
           mkdir sdk-pack\lib\columns_ui\foobar2000\SDK
           mkdir sdk-pack\lib\columns_ui\foobar2000\shared
           mkdir sdk-pack\lib\columns_ui\pfc
+          mkdir sdk-pack\lib\columns_ui\libPPUI
 
-          :: foobar2000_SDK.lib 4 个配置
+          :: foobar2000_SDK.lib (4 configs)
           xcopy /E /I downloaded\sdk-debug-x86\debug-x86\foobar2000_SDK sdk-pack\lib\columns_ui\foobar2000\SDK\debug-x86\foobar2000_SDK\
           xcopy /E /I downloaded\sdk-x86\x86\foobar2000_SDK          sdk-pack\lib\columns_ui\foobar2000\SDK\x86\foobar2000_SDK\
           xcopy /E /I downloaded\sdk-debug-x64\debug-x64\foobar2000_SDK sdk-pack\lib\columns_ui\foobar2000\SDK\debug-x64\foobar2000_SDK\
           xcopy /E /I downloaded\sdk-x64\x64\foobar2000_SDK            sdk-pack\lib\columns_ui\foobar2000\SDK\x64\foobar2000_SDK\
 
-          :: pfc.lib 4 个配置
+          :: pfc.lib (4 configs)
           xcopy /E /I downloaded\sdk-debug-x86\debug-x86\pfc sdk-pack\lib\columns_ui\pfc\debug-x86\pfc\
           xcopy /E /I downloaded\sdk-x86\x86\pfc            sdk-pack\lib\columns_ui\pfc\x86\pfc\
           xcopy /E /I downloaded\sdk-debug-x64\debug-x64\pfc sdk-pack\lib\columns_ui\pfc\debug-x64\pfc\
           xcopy /E /I downloaded\sdk-x64\x64\pfc            sdk-pack\lib\columns_ui\pfc\x64\pfc\
 
-          :: shared 库（shared-Win32.lib / shared-x64.lib）
+          :: libPPUI.lib (4 configs, path format: libPPUI\<outdir>\Release\libPPUI.lib)
+          xcopy /E /I downloaded\sdk-debug-x86\debug-x86\libPPUI sdk-pack\lib\columns_ui\libPPUI\debug-x86\
+          xcopy /E /I downloaded\sdk-x86\x86\libPPUI            sdk-pack\lib\columns_ui\libPPUI\x86\
+          xcopy /E /I downloaded\sdk-debug-x64\debug-x64\libPPUI sdk-pack\lib\columns_ui\libPPUI\debug-x64\
+          xcopy /E /I downloaded\sdk-x64\x64\libPPUI            sdk-pack\lib\columns_ui\libPPUI\x64\
+
+          :: shared libs
           copy downloaded\sdk-shared-Win32\shared-output\shared-Win32.lib sdk-pack\lib\columns_ui\foobar2000\shared\
           copy downloaded\sdk-shared-x64\shared-output\shared-x64.lib    sdk-pack\lib\columns_ui\foobar2000\shared\
 
-          :: 顺便也保留 SDK 源代码（foo_nowbar 编译时需要头文件）
-          :: 这部分通过 checkout 拉取，不需要打包
-
+          echo === Final structure ===
           dir sdk-pack\lib\columns_ui /s
 
       - name: Create zip
@@ -212,5 +218,4 @@ jobs:
           tag_name: sdk-${{ github.run_number }}
           name: foobar2000 SDK build #${{ github.run_number }}
           files: foobar2000-sdk-libs.zip
-          generate_release_notes: false
           prerelease: false
