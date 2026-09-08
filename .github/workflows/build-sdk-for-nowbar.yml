@@ -1,0 +1,241 @@
+name: Build foobar2000 SDK for foo_nowbar (x86 + x64, Debug + Release)
+
+# =============================================================================
+# 此 workflow 专门为 foo_nowbar 插件编译所需的 foobar2000 SDK 依赖库
+# 输出：foobar2000-sdk-libs-for-nowbar.zip
+#   - foobar2000_SDK.lib   (4 配置: debug-x86, x86, debug-x64, x64)
+#   - pfc.lib              (4 配置: 同上)
+#   - shared-Win32.lib     (Release|Win32)
+#   - shared-x64.lib       (Release|x64)
+#   - foobar2000_component_client.lib (4 配置)
+#   - helpers/foobar2000_sdk_helpers.lib (4 配置, 如存在)
+# 注意：libPPUI 不编译（foo_nowbar 不链接 libPPUI.lib，只需头文件）
+# =============================================================================
+
+on:
+  workflow_dispatch:  # 手动触发
+  push:
+    paths:
+      - '**/*.vcxproj'
+      - '**/*.h'
+      - '**/*.cpp'
+      - '.github/workflows/build-sdk-for-nowbar.yml'
+
+jobs:
+  # =============================================================================
+  # 1. 编译 foobar2000_SDK.lib / pfc.lib / component_client.lib / helpers.lib
+  #    4 个配置矩阵: Debug|Win32, Release|Win32, Debug|x64, Release|x64
+  # =============================================================================
+  build:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        include:
+          # foo_nowbar 需要的 4 个配置（对应 lib/columns_ui 下的目录名）
+          - { platform: Win32, configuration: Debug,   outdir: debug-x86 }
+          - { platform: Win32, configuration: Release, outdir: x86 }
+          - { platform: x64,   configuration: Debug,   outdir: debug-x64 }
+          - { platform: x64,   configuration: Release, outdir: x64 }
+
+    steps:
+      - name: Checkout SDK 源代码
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: 修复 PlatformToolset v142 -> v143 (使用 VS2022 编译)
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Recurse -Filter *.vcxproj | ForEach-Object {
+            $content = Get-Content $_.FullName -Raw
+            if ($content -match '<PlatformToolset>v142</PlatformToolset>') {
+              Write-Host "Fixing: $($_.FullName)"
+              $content = $content.Replace('<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>')
+              Set-Content -Path $_.FullName -Value $content -NoNewline
+            }
+          }
+
+      - name: 编译 foobar2000_SDK.lib (foo_nowbar 主依赖)
+        shell: cmd
+        run: |
+          msbuild foobar2000\SDK\foobar2000_SDK.vcxproj ^
+            /p:Configuration=${{ matrix.configuration }} ^
+            /p:Platform=${{ matrix.platform }} ^
+            /p:OutDir=${{ matrix.outdir }}\foobar2000_SDK\ ^
+            /p:IntDir=obj\foobar2000_SDK\${{ matrix.outdir }}\
+
+      - name: 编译 pfc.lib (foo_nowbar 主依赖)
+        shell: cmd
+        run: |
+          msbuild pfc\pfc.vcxproj ^
+            /p:Configuration=${{ matrix.configuration }} ^
+            /p:Platform=${{ matrix.platform }} ^
+            /p:OutDir=${{ matrix.outdir }}\pfc\ ^
+            /p:IntDir=obj\pfc\${{ matrix.outdir }}\
+
+      - name: 编译 foobar2000_component_client.lib (foo_nowbar 备用)
+        shell: cmd
+        run: |
+          msbuild foobar2000\foobar2000_component_client\foobar2000_component_client.vcxproj ^
+            /p:Configuration=${{ matrix.configuration }} ^
+            /p:Platform=${{ matrix.platform }} ^
+            /p:OutDir=${{ matrix.outdir }}\foobar2000_component_client\ ^
+            /p:IntDir=obj\component_client\${{ matrix.outdir }}\
+
+      - name: 编译 helpers (foobar2000_sdk_helpers.lib)
+        shell: cmd
+        run: |
+          if exist foobar2000\helpers\foobar2000_sdk_helpers.vcxproj (
+            msbuild foobar2000\helpers\foobar2000_sdk_helpers.vcxproj ^
+              /p:Configuration=${{ matrix.configuration }} ^
+              /p:Platform=${{ matrix.platform }} ^
+              /p:OutDir=${{ matrix.outdir }}\helpers\ ^
+              /p:IntDir=obj\helpers\${{ matrix.outdir }}\
+          )
+
+      - name: 上传 artifact (${{ matrix.outdir }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-nowbar-${{ matrix.outdir }}
+          path: |
+            ${{ matrix.outdir }}/
+          retention-days: 90
+
+  # =============================================================================
+  # 2. 编译 shared 库 (shared-Win32.lib / shared-x64.lib)
+  #    foo_nowbar 链接这两个 .lib（不链接 libPPUI.lib）
+  #    官方 shared.vcxproj 默认 DynamicLibrary 输出 .dll
+  #    需 patch 为 StaticLibrary 并删除 PostBuildEvent 的 copy 命令
+  # =============================================================================
+  build-shared:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        include:
+          - { platform: Win32, target_name: shared-Win32, outdir_tag: Win32 }
+          - { platform: x64,   target_name: shared-x64,   outdir_tag: x64 }
+    steps:
+      - name: Checkout SDK 源代码
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: 修复 PlatformToolset v142 -> v143
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Recurse -Filter *.vcxproj | ForEach-Object {
+            $content = Get-Content $_.FullName -Raw
+            if ($content -match '<PlatformToolset>v142</PlatformToolset>') {
+              $content = $content.Replace('<PlatformToolset>v142</PlatformToolset>', '<PlatformToolset>v143</PlatformToolset>')
+              Set-Content -Path $_.FullName -Value $content -NoNewline
+            }
+          }
+
+      - name: Patch shared.vcxproj - 转为 StaticLibrary + 删除 PostBuildEvent
+        shell: pwsh
+        run: |
+          $f = 'foobar2000\shared\shared.vcxproj'
+          $c = Get-Content $f -Raw
+          # 1. DynamicLibrary -> StaticLibrary (输出 .lib 而非 .dll)
+          $c = $c.Replace('<ConfigurationType>DynamicLibrary</ConfigurationType>', '<ConfigurationType>StaticLibrary</ConfigurationType>')
+          # 2. 删除 PostBuildEvent（避免 copy shared.lib ... 失败）
+          $c = $c -replace '<PostBuildEvent>.*?</PostBuildEvent>', ''
+          # 3. 删除 PreLinkEvent（如果存在）
+          $c = $c -replace '<PreLinkEvent>.*?</PreLinkEvent>', ''
+          Set-Content -Path $f -Value $c -NoNewline
+          Write-Host "Patched shared.vcxproj for foo_nowbar"
+
+      - name: 编译 shared (Release ${{ matrix.platform }})
+        shell: cmd
+        run: |
+          msbuild foobar2000\shared\shared.vcxproj ^
+            /p:Configuration=Release ^
+            /p:Platform=${{ matrix.platform }} ^
+            /p:OutDir=shared-output\ ^
+            /p:IntDir=obj\shared\${{ matrix.outdir_tag }}\
+
+      - name: 重命名 shared.lib -> ${{ matrix.target_name }}.lib
+        shell: cmd
+        run: |
+          :: MSBuild 默认输出 shared.lib，手动重命名为 foo_nowbar 期望的文件名
+          if exist shared-output\shared.lib (
+            move shared-output\shared.lib shared-output\${{ matrix.target_name }}.lib
+          )
+          if exist shared-output\shared.pdb (
+            move shared-output\shared.pdb shared-output\${{ matrix.target_name }}.pdb
+          )
+          echo === shared-output 目录内容 ===
+          dir shared-output\
+
+      - name: 上传 shared artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-nowbar-shared-${{ matrix.outdir_tag }}
+          path: shared-output/
+          retention-days: 90
+
+  # =============================================================================
+  # 3. 合并所有 artifact，按 foo_nowbar 期望的目录结构打包
+  #    最终生成 foobar2000-sdk-libs-for-nowbar.zip
+  #    解压后直接放到 foo_nowbar-main\lib\columns_ui\ 下即可使用
+  # =============================================================================
+  package:
+    needs: [build, build-shared]
+    runs-on: windows-2022
+    steps:
+      - name: 下载所有 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded/
+
+      - name: 按 foo_nowbar 期望目录结构组织
+        shell: cmd
+        run: |
+          mkdir sdk-pack\lib\columns_ui\foobar2000\SDK
+          mkdir sdk-pack\lib\columns_ui\foobar2000\shared
+          mkdir sdk-pack\lib\columns_ui\pfc
+
+          :: foobar2000_SDK.lib 4 个配置
+          xcopy /E /I downloaded\sdk-nowbar-debug-x86\debug-x86\foobar2000_SDK sdk-pack\lib\columns_ui\foobar2000\SDK\debug-x86\foobar2000_SDK\
+          xcopy /E /I downloaded\sdk-nowbar-x86\x86\foobar2000_SDK          sdk-pack\lib\columns_ui\foobar2000\SDK\x86\foobar2000_SDK\
+          xcopy /E /I downloaded\sdk-nowbar-debug-x64\debug-x64\foobar2000_SDK sdk-pack\lib\columns_ui\foobar2000\SDK\debug-x64\foobar2000_SDK\
+          xcopy /E /I downloaded\sdk-nowbar-x64\x64\foobar2000_SDK            sdk-pack\lib\columns_ui\foobar2000\SDK\x64\foobar2000_SDK\
+
+          :: pfc.lib 4 个配置
+          xcopy /E /I downloaded\sdk-nowbar-debug-x86\debug-x86\pfc sdk-pack\lib\columns_ui\pfc\debug-x86\pfc\
+          xcopy /E /I downloaded\sdk-nowbar-x86\x86\pfc            sdk-pack\lib\columns_ui\pfc\x86\pfc\
+          xcopy /E /I downloaded\sdk-nowbar-debug-x64\debug-x64\pfc sdk-pack\lib\columns_ui\pfc\debug-x64\pfc\
+          xcopy /E /I downloaded\sdk-nowbar-x64\x64\pfc            sdk-pack\lib\columns_ui\pfc\x64\pfc\
+
+          :: shared 库（foo_nowbar 链接这两个 .lib）
+          copy downloaded\sdk-nowbar-shared-Win32\shared-output\shared-Win32.lib sdk-pack\lib\columns_ui\foobar2000\shared\
+          copy downloaded\sdk-nowbar-shared-x64\shared-output\shared-x64.lib    sdk-pack\lib\columns_ui\foobar2000\shared\
+
+          :: SDK 源代码（头文件）不打包，foo_nowbar 编译时通过 checkout 获取
+
+          echo === 最终目录结构（foo_nowbar 期望）===
+          dir sdk-pack\lib\columns_ui /s
+
+      - name: 创建 zip 包
+        shell: powershell
+        run: |
+          Compress-Archive -Path sdk-pack\* -DestinationPath foobar2000-sdk-libs-for-nowbar.zip -CompressionLevel Optimal
+
+      - name: 上传最终 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: foobar2000-sdk-libs-for-nowbar
+          path: foobar2000-sdk-libs-for-nowbar.zip
+          retention-days: 90
+
+      - name: 创建 Release (foo_nowbar 用)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sdk-nowbar-${{ github.run_number }}
+          name: foobar2000 SDK for foo_nowbar build #${{ github.run_number }}
+          files: foobar2000-sdk-libs-for-nowbar.zip
+          generate_release_notes: false
+          prerelease: false
